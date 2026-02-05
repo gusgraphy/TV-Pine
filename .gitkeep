@@ -1,0 +1,191 @@
+//@version=6
+indicator("Market Gate + Attestation + Recover Add (Signals Only)", shorttitle="MG-AR Signals", overlay=true, max_labels_count=500)
+
+// ---------------------------
+// Inputs
+// ---------------------------
+marketSmaLen = input.int(20, "Market Gate SMA Length", minval=1, tooltip="SMA length for SPY/QQQ risk-off filter.")
+requireBoth = input.bool(false, "Require BOTH below SMA for NO-GO", tooltip="If true, market is NO-GO only when BOTH SPY and QQQ are below their SMA. If false, either below SMA triggers NO-GO.")
+useVixFilter = input.bool(false, "Enable VIX Filter", tooltip="Optional VIX filter: if enabled, VIX must be below its SMA to allow GO.")
+vixSmaLen = input.int(10, "VIX SMA Length", minval=1, tooltip="SMA length for VIX confirmation.")
+
+reclaimMode = input.string("Manual", "Reclaim Level Mode", options=["Manual", "Auto"], tooltip="Manual uses your reclaimLevel input. Auto uses highest close of last N bars.")
+reclaimLevelInput = input.float(0.0, "Reclaim Level (Manual)", tooltip="Manual reclaim level. Set to key level you want price to reclaim.")
+autoReclaimLookback = input.int(20, "Auto Reclaim Lookback", minval=5, tooltip="Auto reclaim uses highest close of last N bars.")
+
+retestBars = input.int(3, "Retest Window (bars)", minval=1, tooltip="Retest must occur within this many bars after the reclaim cross.")
+retestBufferPct = input.float(0.5, "Retest Buffer %", minval=0.0, step=0.1, tooltip="Buffer around reclaim level for retest hold.")
+
+entryMode = input.string("Close", "Entry Mode", options=["Close", "Breakout"], tooltip="Close: enter on attestation bar close. Breakout: enter when close exceeds prior high.")
+
+bandPercent = input.float(1.0, "Recover Add Zone %", minval=0.1, step=0.1, tooltip="Percent band around reclaimLevel for recover add zone.")
+spacingPercent = input.float(10.0, "Add Spacing %", minval=1.0, step=0.5, tooltip="Next add allowed only if price is this % below last add price.")
+maxAdds = input.int(2, "Max Adds", minval=0, maxval=3, tooltip="Maximum recover adds after attestation (0-3).")
+enableThirdAdd = input.bool(false, "Enable Add 3 (0.25x)", tooltip="Enable optional third add at 0.25x size.")
+
+invalidateBuffer = input.float(2.0, "Invalidation Buffer %", minval=0.1, step=0.1, tooltip="Close below reclaimLevel by this % flags setup failure.")
+autoExitOnFailure = input.bool(false, "Auto Exit On Failure", tooltip="If true, virtual position exits on invalidation.")
+
+partialExitEnabled = input.bool(true, "Partial Exit at TP1", tooltip="If true, simulate partial exit at TP1.")
+partialPercent = input.float(50.0, "Partial Exit %", minval=1.0, maxval=99.0, step=1.0, tooltip="Percent of virtual size to reduce on TP1.")
+tpPercent1 = input.float(10.0, "TP1 %", minval=1.0, step=0.5, tooltip="TP1 percent above avg price.")
+useTP2 = input.bool(false, "Enable TP2", tooltip="If true, mark a second take-profit level.")
+tpPercent2 = input.float(20.0, "TP2 %", minval=1.0, step=0.5, tooltip="TP2 percent above avg price.")
+
+showTable = input.bool(true, "Show Status Table", tooltip="Show Market Gate/Attestation/GO status in a top-right table.")
+
+// ---------------------------
+// Market Gate (SPY/QQQ/VIX)
+// ---------------------------
+spyClose = request.security("SPY", "D", close)
+qqqClose = request.security("QQQ", "D", close)
+spySma = ta.sma(spyClose, marketSmaLen)
+qqqSma = ta.sma(qqqClose, marketSmaLen)
+
+riskOff = requireBoth ? (spyClose < spySma and qqqClose < qqqSma) : (spyClose < spySma or qqqClose < qqqSma)
+marketGateGo = not riskOff
+
+vixClose = request.security("CBOE:VIX", "D", close)
+vixSma = ta.sma(vixClose, vixSmaLen)
+vixOk = not useVixFilter or vixClose < vixSma
+
+marketGateFinal = marketGateGo and vixOk
+
+// ---------------------------
+// Per-symbol Attestation (Reclaim + Hold)
+// ---------------------------
+reclaimLevel = reclaimMode == "Manual" ? reclaimLevelInput : ta.highest(close, autoReclaimLookback)
+reclaimCross = close > reclaimLevel and close[1] <= reclaimLevel
+
+retestBuffer = reclaimLevel * retestBufferPct / 100
+retestLow = reclaimLevel - retestBuffer
+retestHigh = reclaimLevel + retestBuffer
+
+var int crossBarIndex = na
+if barstate.isconfirmed and reclaimCross
+    crossBarIndex := bar_index
+
+withinRetestWindow = not na(crossBarIndex) and bar_index - crossBarIndex <= retestBars
+retestHold = low <= retestHigh and close >= retestLow
+attestation = barstate.isconfirmed and withinRetestWindow and retestHold
+
+var bool attested = false
+if attestation
+    attested := true
+
+// ---------------------------
+// GO/NO-GO Status
+// ---------------------------
+goSignal = marketGateFinal and attested
+
+// ---------------------------
+// Virtual Position State
+// ---------------------------
+var bool inPos = false
+var float avgPrice = na
+var int addsCount = 0
+var float lastAddPrice = na
+var float virtualSize = 0.0
+var bool setupFailed = false
+
+entryAllowed = barstate.isconfirmed and goSignal and not inPos
+entryTrigger = entryMode == "Close" ? true : close > high[1]
+
+if entryAllowed and entryTrigger
+    inPos := true
+    avgPrice := close
+    addsCount := 0
+    lastAddPrice := close
+    virtualSize := 1.0
+    setupFailed := false
+    label.new(bar_index, low, "VIRTUAL ENTRY", style=label.style_label_up, color=color.new(color.green, 0), textcolor=color.white)
+
+// ---------------------------
+// Recover Add (Virtual)
+// ---------------------------
+addZoneLow = reclaimLevel * (1 - bandPercent / 100)
+addZoneHigh = reclaimLevel * (1 + bandPercent / 100)
+spacingLevel = lastAddPrice * (1 - spacingPercent / 100)
+
+addAllowed = barstate.isconfirmed and inPos and attested and not setupFailed and close >= addZoneLow and close <= addZoneHigh and close <= spacingLevel and addsCount < maxAdds
+
+nextAddSize = addsCount == 0 ? 0.5 : addsCount == 1 ? 0.5 : 0.25
+addEnabled = addsCount < 2 or enableThirdAdd
+
+if addAllowed and addEnabled
+    newSize = virtualSize + nextAddSize
+    avgPrice := (avgPrice * virtualSize + close * nextAddSize) / newSize
+    virtualSize := newSize
+    addsCount += 1
+    lastAddPrice := close
+    label.new(bar_index, low, "VIRTUAL ADD " + str.tostring(addsCount), style=label.style_label_up, color=color.new(color.teal, 0), textcolor=color.white)
+
+// ---------------------------
+// Take Profit (Virtual)
+// ---------------------------
+TP1 = inPos ? avgPrice * (1 + tpPercent1 / 100) : na
+TP2 = inPos and useTP2 ? avgPrice * (1 + tpPercent2 / 100) : na
+
+var bool tp1Hit = false
+if inPos and not tp1Hit and barstate.isconfirmed and high >= TP1
+    tp1Hit := true
+    label.new(bar_index, high, "TP1 HIT", style=label.style_label_down, color=color.new(color.green, 0), textcolor=color.white)
+    if partialExitEnabled
+        virtualSize := math.max(0.0, virtualSize * (1 - partialPercent / 100))
+        if virtualSize == 0
+            inPos := false
+            avgPrice := na
+            lastAddPrice := na
+            addsCount := 0
+
+// ---------------------------
+// Invalidation (Decision Flag)
+// ---------------------------
+invalidationLevel = reclaimLevel * (1 - invalidateBuffer / 100)
+
+if inPos and barstate.isconfirmed and close < invalidationLevel
+    setupFailed := true
+    label.new(bar_index, high, "SETUP FAILED", style=label.style_label_down, color=color.new(color.red, 0), textcolor=color.white)
+    if autoExitOnFailure
+        inPos := false
+        avgPrice := na
+        lastAddPrice := na
+        addsCount := 0
+        virtualSize := 0.0
+
+if attestation
+    setupFailed := false
+
+// ---------------------------
+// Visuals
+// ---------------------------
+plot(reclaimLevel, "Reclaim Level", color=color.new(color.blue, 0), linewidth=2)
+plot(invalidationLevel, "Invalidation", color=color.new(color.red, 0), linewidth=1, style=plot.style_linebr)
+plot(TP1, "TP1", color=color.new(color.green, 0), linewidth=1, style=plot.style_linebr)
+plot(TP2, "TP2", color=color.new(color.lime, 0), linewidth=1, style=plot.style_linebr)
+plot(inPos ? avgPrice : na, "Avg Price", color=color.new(color.orange, 0), linewidth=2)
+
+// Status label on last bar
+if barstate.islastconfirmedhistory
+    label.new(bar_index, high, "Gate: " + (marketGateFinal ? "GO" : "NO-GO") + " | GO: " + (goSignal ? "YES" : "NO"), style=label.style_label_down, color=color.new(color.black, 0), textcolor=color.white)
+
+// ---------------------------
+// Table Output
+// ---------------------------
+var table statusTable = table.new(position.top_right, 2, 5, border_width=1)
+
+if showTable and barstate.isconfirmed
+    table.cell(statusTable, 0, 0, "Market Gate", text_color=color.white, bgcolor=color.new(color.black, 0))
+    table.cell(statusTable, 1, 0, marketGateFinal ? "GO" : "NO-GO", text_color=marketGateFinal ? color.green : color.red)
+
+    table.cell(statusTable, 0, 1, "Attestation", text_color=color.white, bgcolor=color.new(color.black, 0))
+    table.cell(statusTable, 1, 1, attested ? "YES" : "NO", text_color=attested ? color.green : color.red)
+
+    table.cell(statusTable, 0, 2, "GO/NO-GO", text_color=color.white, bgcolor=color.new(color.black, 0))
+    table.cell(statusTable, 1, 2, goSignal ? "GO" : "NO-GO", text_color=goSignal ? color.green : color.red)
+
+    table.cell(statusTable, 0, 3, "In Position", text_color=color.white, bgcolor=color.new(color.black, 0))
+    table.cell(statusTable, 1, 3, inPos ? "YES" : "NO", text_color=inPos ? color.green : color.red)
+
+    table.cell(statusTable, 0, 4, "Adds Count", text_color=color.white, bgcolor=color.new(color.black, 0))
+    table.cell(statusTable, 1, 4, str.tostring(addsCount))
