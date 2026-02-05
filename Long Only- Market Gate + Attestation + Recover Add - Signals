@@ -1,0 +1,413 @@
+//@version=6
+indicator("Market Gate + Attestation + Recover Add (Signals Only)", shorttitle="MG-AR Signals", overlay=true, max_labels_count=500)
+
+// ---------------------------
+// Inputs Open the indicator settings on your chart.
+
+// 1 - Enable Slot 1 Enabled (and/or Slot 2/3 as needed).
+
+// 2 - Enter the Slot Entry Price and Slot Entry Time for your manual position.
+
+// 3 - Optionally add a Slot Label Text for context (e.g., “starter” or “swing”).
+
+// - 4 Repeat per ticker/chart as needed — slots are per-symbol/per-chart.
+// ---------------------------
+
+
+
+
+marketIndex = input.string("QQQ", "Market Attestation Index", options=["QQQ", "SPY"], tooltip="Choose which index drives the 2-day market attestation.")
+
+useManualReclaim = input.bool(false, "Use Manual Reclaim Level", tooltip="Enable to use a manual reclaim level instead of auto.")
+reclaimLevelManual = input.float(0.0, "Reclaim Level (Manual)", step=0.01, tooltip="Set a manual reclaim level.")
+autoReclaimLookback = input.int(20, "Auto Reclaim Lookback", minval=5, tooltip="Auto reclaim uses highest close of last N bars.")
+retestBars = input.int(3, "Retest Window (bars)", minval=1, tooltip="Retest must occur within this many daily bars after reclaim.")
+retestBufferPct = input.float(0.5, "Retest Buffer %", minval=0.0, step=0.1, tooltip="Buffer around reclaim level for retest hold.")
+
+bandPercent = input.float(1.0, "Recover Add Zone %", minval=0.1, step=0.1, tooltip="Percent band around reclaimLevel for recover add zone.")
+spacingPercent = input.float(10.0, "Add Spacing %", minval=1.0, step=0.5, tooltip="Next add allowed only if price is this % below last add price.")
+maxAdds = input.int(2, "Max Adds", minval=0, maxval=3, tooltip="Maximum recover adds after attestation (0-3).")
+
+invalidateBuffer = input.float(2.0, "Invalidation Buffer %", minval=0.1, step=0.1, tooltip="Close below reclaimLevel by this % flags setup failure.")
+autoClearOnReattest = input.bool(true, "Clear Failure on Reattest", tooltip="If true, clear setupFailed when a new local attestation occurs.")
+
+showTable = input.bool(true, "Show Status Table", tooltip="Show status table in top-right.")
+
+tp1Percent = input.float(10.0, "TP1 %", minval=1.0, step=0.5, tooltip="TP1 percent above entry price.")
+useTP2 = input.bool(false, "Enable TP2", tooltip="If true, mark a second take-profit level.")
+tp2Percent = input.float(20.0, "TP2 %", minval=1.0, step=0.5, tooltip="TP2 percent above entry price.")
+
+slot1Enabled = input.bool(false, "Slot 1 Enabled")
+slot1Price = input.float(0.0, "Slot 1 Entry Price", step=0.01)
+slot1Time = input.time(timestamp("2024-01-01T00:00:00"), "Slot 1 Entry Time")
+slot1Label = input.string("", "Slot 1 Label Text")
+
+slot2Enabled = input.bool(false, "Slot 2 Enabled")
+slot2Price = input.float(0.0, "Slot 2 Entry Price", step=0.01)
+slot2Time = input.time(timestamp("2024-01-01T00:00:00"), "Slot 2 Entry Time")
+slot2Label = input.string("", "Slot 2 Label Text")
+
+slot3Enabled = input.bool(false, "Slot 3 Enabled")
+slot3Price = input.float(0.0, "Slot 3 Entry Price", step=0.01)
+slot3Time = input.time(timestamp("2024-01-01T00:00:00"), "Slot 3 Entry Time")
+slot3Label = input.string("", "Slot 3 Label Text")
+
+// ---------------------------
+// Market Gate (Daily)
+// ---------------------------
+spyClose = request.security("SPY", "D", close, lookahead=barmerge.lookahead_off)
+qqqClose = request.security("QQQ", "D", close, lookahead=barmerge.lookahead_off)
+vixClose = request.security("CBOE:VIX", "D", close, lookahead=barmerge.lookahead_off)
+
+spySMA = ta.sma(spyClose, 20)
+qqqSMA = ta.sma(qqqClose, 20)
+vixSMA = ta.sma(vixClose, 10)
+
+marketTicker = marketIndex == "SPY" ? "SPY" : "QQQ"
+marketDailyClose = request.security(marketTicker, "D", close, lookahead=barmerge.lookahead_off)
+marketDailyHigh = request.security(marketTicker, "D", high, lookahead=barmerge.lookahead_off)
+marketDailyLow = request.security(marketTicker, "D", low, lookahead=barmerge.lookahead_off)
+marketConfirmed = request.security(marketTicker, "D", barstate.isconfirmed, lookahead=barmerge.lookahead_off)
+
+marketRange = math.max(marketDailyHigh - marketDailyLow, syminfo.mintick)
+marketDay1 = marketDailyLow < marketDailyLow[1] and marketDailyClose > marketDailyClose[1] and (marketDailyClose - marketDailyLow) / marketRange >= 0.70
+marketDay2 = marketDailyHigh > marketDailyHigh[1] and marketDailyClose > marketDailyClose[1]
+
+marketDay1Confirmed = marketDay1 and marketConfirmed
+marketDay2Confirmed = marketDay2 and marketConfirmed
+marketAttested = marketDay1[1] and marketDay2 and marketConfirmed
+
+marketGate = marketAttested and vixClose <= vixSMA
+
+// ---------------------------
+// Local (Symbol) Attestation (Daily)
+// ---------------------------
+localDailyClose = request.security(syminfo.tickerid, "D", close, lookahead=barmerge.lookahead_off)
+localDailyHigh = request.security(syminfo.tickerid, "D", high, lookahead=barmerge.lookahead_off)
+localDailyLow = request.security(syminfo.tickerid, "D", low, lookahead=barmerge.lookahead_off)
+localConfirmed = request.security(syminfo.tickerid, "D", barstate.isconfirmed, lookahead=barmerge.lookahead_off)
+localDailyIndex = request.security(syminfo.tickerid, "D", bar_index, lookahead=barmerge.lookahead_off)
+
+reclaimLevelAuto = ta.highest(localDailyClose, autoReclaimLookback)
+reclaimLevel = useManualReclaim ? reclaimLevelManual : reclaimLevelAuto
+
+reclaimCross = localDailyClose > reclaimLevel and localDailyClose[1] <= reclaimLevel
+
+retestLow = reclaimLevel * (1 - retestBufferPct / 100)
+retestHigh = reclaimLevel * (1 + retestBufferPct / 100)
+retestHold = localDailyLow <= retestHigh and localDailyClose >= retestLow
+
+var int localCrossIndex = na
+if localConfirmed and reclaimCross
+    localCrossIndex := localDailyIndex
+
+withinRetestWindow = not na(localCrossIndex) and localDailyIndex - localCrossIndex <= retestBars
+
+var bool localAttested = false
+if localConfirmed and withinRetestWindow and retestHold
+    localAttested := true
+
+// ---------------------------
+// GO/NO-GO Status
+// ---------------------------
+goSignal = marketGate and localAttested
+
+// ---------------------------
+// Manual Position Slots
+// ---------------------------
+slot1Tp1 = slot1Price * (1 + tp1Percent / 100)
+slot2Tp1 = slot2Price * (1 + tp1Percent / 100)
+slot3Tp1 = slot3Price * (1 + tp1Percent / 100)
+
+slot1Tp2 = slot1Price * (1 + tp2Percent / 100)
+slot2Tp2 = slot2Price * (1 + tp2Percent / 100)
+slot3Tp2 = slot3Price * (1 + tp2Percent / 100)
+
+var line slot1Line = na
+var line slot2Line = na
+var line slot3Line = na
+var line slot1Tp1Line = na
+var line slot2Tp1Line = na
+var line slot3Tp1Line = na
+var line slot1Tp2Line = na
+var line slot2Tp2Line = na
+var line slot3Tp2Line = na
+
+var label slot1EntryLabel = na
+var label slot2EntryLabel = na
+var label slot3EntryLabel = na
+
+var bool slot1Tp1Hit = false
+var bool slot2Tp1Hit = false
+var bool slot3Tp1Hit = false
+
+var float slot1PrevPrice = na
+var float slot2PrevPrice = na
+var float slot3PrevPrice = na
+
+// Slot 1 visuals
+if slot1Enabled
+    if na(slot1Line)
+        slot1Line := line.new(slot1Time, slot1Price, time, slot1Price, xloc=xloc.bar_time, extend=extend.none, color=color.new(color.blue, 0), width=2)
+    else
+        line.set_x1(slot1Line, slot1Time)
+        line.set_y1(slot1Line, slot1Price)
+        line.set_x2(slot1Line, time)
+        line.set_y2(slot1Line, slot1Price)
+
+    if na(slot1EntryLabel)
+        slot1EntryLabel := label.new(slot1Time, slot1Price, "MANUAL LONG @ " + str.tostring(slot1Price) + " " + slot1Label, xloc=xloc.bar_time, style=label.style_label_left, color=color.new(color.blue, 0), textcolor=color.white)
+    else
+        label.set_x(slot1EntryLabel, slot1Time)
+        label.set_y(slot1EntryLabel, slot1Price)
+        label.set_text(slot1EntryLabel, "MANUAL LONG @ " + str.tostring(slot1Price) + " " + slot1Label)
+
+    if na(slot1Tp1Line)
+        slot1Tp1Line := line.new(slot1Time, slot1Tp1, time, slot1Tp1, xloc=xloc.bar_time, extend=extend.none, color=color.new(color.green, 0), width=1)
+    else
+        line.set_x1(slot1Tp1Line, slot1Time)
+        line.set_y1(slot1Tp1Line, slot1Tp1)
+        line.set_x2(slot1Tp1Line, time)
+        line.set_y2(slot1Tp1Line, slot1Tp1)
+
+    if useTP2
+        if na(slot1Tp2Line)
+            slot1Tp2Line := line.new(slot1Time, slot1Tp2, time, slot1Tp2, xloc=xloc.bar_time, extend=extend.none, color=color.new(color.lime, 0), width=1)
+        else
+            line.set_x1(slot1Tp2Line, slot1Time)
+            line.set_y1(slot1Tp2Line, slot1Tp2)
+            line.set_x2(slot1Tp2Line, time)
+            line.set_y2(slot1Tp2Line, slot1Tp2)
+    else
+        if not na(slot1Tp2Line)
+            line.delete(slot1Tp2Line)
+            slot1Tp2Line := na
+else
+    if not na(slot1Line)
+        line.delete(slot1Line)
+        slot1Line := na
+    if not na(slot1Tp1Line)
+        line.delete(slot1Tp1Line)
+        slot1Tp1Line := na
+    if not na(slot1Tp2Line)
+        line.delete(slot1Tp2Line)
+        slot1Tp2Line := na
+    if not na(slot1EntryLabel)
+        label.delete(slot1EntryLabel)
+        slot1EntryLabel := na
+
+// Slot 2 visuals
+if slot2Enabled
+    if na(slot2Line)
+        slot2Line := line.new(slot2Time, slot2Price, time, slot2Price, xloc=xloc.bar_time, extend=extend.none, color=color.new(color.blue, 0), width=2)
+    else
+        line.set_x1(slot2Line, slot2Time)
+        line.set_y1(slot2Line, slot2Price)
+        line.set_x2(slot2Line, time)
+        line.set_y2(slot2Line, slot2Price)
+
+    if na(slot2EntryLabel)
+        slot2EntryLabel := label.new(slot2Time, slot2Price, "MANUAL LONG @ " + str.tostring(slot2Price) + " " + slot2Label, xloc=xloc.bar_time, style=label.style_label_left, color=color.new(color.blue, 0), textcolor=color.white)
+    else
+        label.set_x(slot2EntryLabel, slot2Time)
+        label.set_y(slot2EntryLabel, slot2Price)
+        label.set_text(slot2EntryLabel, "MANUAL LONG @ " + str.tostring(slot2Price) + " " + slot2Label)
+
+    if na(slot2Tp1Line)
+        slot2Tp1Line := line.new(slot2Time, slot2Tp1, time, slot2Tp1, xloc=xloc.bar_time, extend=extend.none, color=color.new(color.green, 0), width=1)
+    else
+        line.set_x1(slot2Tp1Line, slot2Time)
+        line.set_y1(slot2Tp1Line, slot2Tp1)
+        line.set_x2(slot2Tp1Line, time)
+        line.set_y2(slot2Tp1Line, slot2Tp1)
+
+    if useTP2
+        if na(slot2Tp2Line)
+            slot2Tp2Line := line.new(slot2Time, slot2Tp2, time, slot2Tp2, xloc=xloc.bar_time, extend=extend.none, color=color.new(color.lime, 0), width=1)
+        else
+            line.set_x1(slot2Tp2Line, slot2Time)
+            line.set_y1(slot2Tp2Line, slot2Tp2)
+            line.set_x2(slot2Tp2Line, time)
+            line.set_y2(slot2Tp2Line, slot2Tp2)
+    else
+        if not na(slot2Tp2Line)
+            line.delete(slot2Tp2Line)
+            slot2Tp2Line := na
+else
+    if not na(slot2Line)
+        line.delete(slot2Line)
+        slot2Line := na
+    if not na(slot2Tp1Line)
+        line.delete(slot2Tp1Line)
+        slot2Tp1Line := na
+    if not na(slot2Tp2Line)
+        line.delete(slot2Tp2Line)
+        slot2Tp2Line := na
+    if not na(slot2EntryLabel)
+        label.delete(slot2EntryLabel)
+        slot2EntryLabel := na
+
+// Slot 3 visuals
+if slot3Enabled
+    if na(slot3Line)
+        slot3Line := line.new(slot3Time, slot3Price, time, slot3Price, xloc=xloc.bar_time, extend=extend.none, color=color.new(color.blue, 0), width=2)
+    else
+        line.set_x1(slot3Line, slot3Time)
+        line.set_y1(slot3Line, slot3Price)
+        line.set_x2(slot3Line, time)
+        line.set_y2(slot3Line, slot3Price)
+
+    if na(slot3EntryLabel)
+        slot3EntryLabel := label.new(slot3Time, slot3Price, "MANUAL LONG @ " + str.tostring(slot3Price) + " " + slot3Label, xloc=xloc.bar_time, style=label.style_label_left, color=color.new(color.blue, 0), textcolor=color.white)
+    else
+        label.set_x(slot3EntryLabel, slot3Time)
+        label.set_y(slot3EntryLabel, slot3Price)
+        label.set_text(slot3EntryLabel, "MANUAL LONG @ " + str.tostring(slot3Price) + " " + slot3Label)
+
+    if na(slot3Tp1Line)
+        slot3Tp1Line := line.new(slot3Time, slot3Tp1, time, slot3Tp1, xloc=xloc.bar_time, extend=extend.none, color=color.new(color.green, 0), width=1)
+    else
+        line.set_x1(slot3Tp1Line, slot3Time)
+        line.set_y1(slot3Tp1Line, slot3Tp1)
+        line.set_x2(slot3Tp1Line, time)
+        line.set_y2(slot3Tp1Line, slot3Tp1)
+
+    if useTP2
+        if na(slot3Tp2Line)
+            slot3Tp2Line := line.new(slot3Time, slot3Tp2, time, slot3Tp2, xloc=xloc.bar_time, extend=extend.none, color=color.new(color.lime, 0), width=1)
+        else
+            line.set_x1(slot3Tp2Line, slot3Time)
+            line.set_y1(slot3Tp2Line, slot3Tp2)
+            line.set_x2(slot3Tp2Line, time)
+            line.set_y2(slot3Tp2Line, slot3Tp2)
+    else
+        if not na(slot3Tp2Line)
+            line.delete(slot3Tp2Line)
+            slot3Tp2Line := na
+else
+    if not na(slot3Line)
+        line.delete(slot3Line)
+        slot3Line := na
+    if not na(slot3Tp1Line)
+        line.delete(slot3Tp1Line)
+        slot3Tp1Line := na
+    if not na(slot3Tp2Line)
+        line.delete(slot3Tp2Line)
+        slot3Tp2Line := na
+    if not na(slot3EntryLabel)
+        label.delete(slot3EntryLabel)
+        slot3EntryLabel := na
+
+// TP1 hit labels
+if slot1Enabled and (na(slot1PrevPrice) or slot1PrevPrice != slot1Price)
+    slot1Tp1Hit := false
+slot1PrevPrice := slot1Price
+
+if slot2Enabled and (na(slot2PrevPrice) or slot2PrevPrice != slot2Price)
+    slot2Tp1Hit := false
+slot2PrevPrice := slot2Price
+
+if slot3Enabled and (na(slot3PrevPrice) or slot3PrevPrice != slot3Price)
+    slot3Tp1Hit := false
+slot3PrevPrice := slot3Price
+
+if slot1Enabled and not slot1Tp1Hit and high >= slot1Tp1
+    slot1Tp1Hit := true
+    label.new(bar_index, high, "TP1 HIT", style=label.style_label_down, color=color.new(color.green, 0), textcolor=color.white)
+
+if slot2Enabled and not slot2Tp1Hit and high >= slot2Tp1
+    slot2Tp1Hit := true
+    label.new(bar_index, high, "TP1 HIT", style=label.style_label_down, color=color.new(color.green, 0), textcolor=color.white)
+
+if slot3Enabled and not slot3Tp1Hit and high >= slot3Tp1
+    slot3Tp1Hit := true
+    label.new(bar_index, high, "TP1 HIT", style=label.style_label_down, color=color.new(color.green, 0), textcolor=color.white)
+
+// ---------------------------
+// Recover Add (Signals Only) using Slot 1
+// ---------------------------
+addZoneLow = reclaimLevel * (1 - bandPercent / 100)
+addZoneHigh = reclaimLevel * (1 + bandPercent / 100)
+
+intradayRecover = low <= addZoneLow and close >= addZoneLow
+insideAddZone = (localDailyClose >= addZoneLow and localDailyClose <= addZoneHigh) or intradayRecover
+
+var int addsCount = 0
+var float lastAddPrice = na
+var bool setupFailed = false
+
+spacingOk = na(lastAddPrice) or localDailyClose <= lastAddPrice * (1 - spacingPercent / 100)
+
+recoverAddToday = marketGate and localAttested and slot1Enabled and not setupFailed and insideAddZone and spacingOk and addsCount < maxAdds
+
+if recoverAddToday and localConfirmed
+    addsCount += 1
+    lastAddPrice := localDailyClose
+    label.new(bar_index, low, "RECOVER ADD", style=label.style_label_up, color=color.new(color.teal, 0), textcolor=color.white)
+
+// ---------------------------
+// Invalidation (Decision Flag)
+// ---------------------------
+invalidationLevel = reclaimLevel * (1 - invalidateBuffer / 100)
+
+if localConfirmed and localAttested and localDailyClose < invalidationLevel
+    setupFailed := true
+    localAttested := false
+    label.new(bar_index, high, "SETUP FAILED", style=label.style_label_down, color=color.new(color.red, 0), textcolor=color.white)
+
+if localConfirmed and autoClearOnReattest and withinRetestWindow and retestHold
+    setupFailed := false
+
+// ---------------------------
+// Visuals
+// ---------------------------
+plot(reclaimLevel, "Reclaim Level", color=color.new(color.blue, 0), linewidth=2)
+plot(invalidationLevel, "Invalidation", color=color.new(color.red, 0), linewidth=1, style=plot.style_linebr)
+
+// ---------------------------
+// Labels for Market Attestation
+// ---------------------------
+if marketDay1Confirmed
+    label.new(bar_index, low, "Market Day1", style=label.style_label_up, color=color.new(color.orange, 0), textcolor=color.white)
+
+if marketDay2Confirmed
+    label.new(bar_index, low, "Market Day2", style=label.style_label_up, color=color.new(color.orange, 0), textcolor=color.white)
+
+if localConfirmed and withinRetestWindow and retestHold
+    label.new(bar_index, low, "Local Attested", style=label.style_label_up, color=color.new(color.green, 0), textcolor=color.white)
+
+// ---------------------------
+// Table Output
+// ---------------------------
+var table statusTable = table.new(position.top_right, 2, 10, border_width=1)
+
+if showTable and barstate.isconfirmed
+    table.cell(statusTable, 0, 0, "Market Gate", text_color=color.white, bgcolor=color.new(color.black, 0))
+    table.cell(statusTable, 1, 0, marketGate ? "GO" : "NO-GO", text_color=marketGate ? color.green : color.red)
+
+    table.cell(statusTable, 0, 1, "Market Attest", text_color=color.white, bgcolor=color.new(color.black, 0))
+    table.cell(statusTable, 1, 1, marketAttested ? "YES" : "NO", text_color=marketAttested ? color.green : color.red)
+
+    table.cell(statusTable, 0, 2, "VIX Filter", text_color=color.white, bgcolor=color.new(color.black, 0))
+    table.cell(statusTable, 1, 2, vixClose <= vixSMA ? "OK" : "RISK", text_color=vixClose <= vixSMA ? color.green : color.red)
+
+    table.cell(statusTable, 0, 3, "Local Attest", text_color=color.white, bgcolor=color.new(color.black, 0))
+    table.cell(statusTable, 1, 3, localAttested ? "YES" : "NO", text_color=localAttested ? color.green : color.red)
+
+    table.cell(statusTable, 0, 4, "GO/NO-GO", text_color=color.white, bgcolor=color.new(color.black, 0))
+    table.cell(statusTable, 1, 4, goSignal ? "GO" : "NO-GO", text_color=goSignal ? color.green : color.red)
+
+    table.cell(statusTable, 0, 5, "Reclaim / Invalid", text_color=color.white, bgcolor=color.new(color.black, 0))
+    table.cell(statusTable, 1, 5, str.tostring(reclaimLevel) + " / " + str.tostring(invalidationLevel), text_color=color.white)
+
+    table.cell(statusTable, 0, 6, "Slot1 Entry/TP1", text_color=color.white, bgcolor=color.new(color.black, 0))
+    table.cell(statusTable, 1, 6, slot1Enabled ? str.tostring(slot1Price) + " / " + str.tostring(slot1Tp1) : "—", text_color=slot1Enabled ? color.white : color.gray)
+
+    table.cell(statusTable, 0, 7, "Recover Add", text_color=color.white, bgcolor=color.new(color.black, 0))
+    table.cell(statusTable, 1, 7, recoverAddToday ? "YES" : "NO", text_color=recoverAddToday ? color.green : color.red)
+
+    table.cell(statusTable, 0, 8, "Add Zone", text_color=color.white, bgcolor=color.new(color.black, 0))
+    table.cell(statusTable, 1, 8, str.tostring(addZoneLow) + " - " + str.tostring(addZoneHigh), text_color=color.white)
+
+    table.cell(statusTable, 0, 9, "Adds Count", text_color=color.white, bgcolor=color.new(color.black, 0))
+    table.cell(statusTable, 1, 9, str.tostring(addsCount), text_color=color.white)
